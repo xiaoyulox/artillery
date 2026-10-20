@@ -100,80 +100,95 @@ async function handler(event, context) {
   }
 
   const interval = setInterval(async () => {
-    const timeRemaining = context.getRemainingTimeInMillis();
+    try {
+      const timeRemaining = context.getRemainingTimeInMillis();
 
-    if (timeRemaining > TIMEOUT_THRESHOLD_MSEC) {
-      return;
+      if (timeRemaining > TIMEOUT_THRESHOLD_MSEC) {
+        return;
+      }
+
+      await mq.send({
+        event: 'workerError',
+        reason: 'AWSLambdaTimeout'
+      });
+
+      clearInterval(interval);
+    } catch (err) {
+      // The watchdog must never crash the process. On a reused (warm)
+      // environment a stale callback would otherwise kill the current
+      // invocation via an unhandled rejection
+      console.error('Error in Lambda timeout watchdog:', err);
     }
-
-    await mq.send({
-      event: 'workerError',
-      reason: 'AWSLambdaTimeout'
-    });
-
-    clearInterval(interval);
   }, 5000).unref();
 
   // TODO: Stop Artillery process - relying on Lambda runtime to shut everything down now
 
-  const s3 = new S3Client();
-  await mq.send({ event: 'workerReady' });
-
-  let waitingFor = 0;
-  const MAX_WAIT_MSEC = 3 * 60 * 1000;
-  const SLEEP_MSEC = 2500;
-
-  if (WAIT_FOR_GREEN) {
-    while (waitingFor < MAX_WAIT_MSEC) {
-      try {
-        const params = {
-          Bucket: BUCKET,
-          Key: `/${TEST_RUN_ID}/green`
-        };
-        await s3.send(new HeadObjectCommand(params));
-        break;
-      } catch (_err) {
-        await sleep(SLEEP_MSEC);
-        waitingFor += SLEEP_MSEC;
-      }
-    }
-  }
-
   try {
-    const { err, code, stdout, stderr } = await execArtillery({
-      SQS_QUEUE_URL,
-      SQS_REGION,
-      TEST_RUN_ID,
-      WORKER_ID,
-      ARTILLERY_ARGS,
-      TEST_DATA_LOCATION,
-      ENV,
-      ARTILLERY_CLOUD_API_KEY,
-      ARTILLERY_CLOUD_ENDPOINT
-    });
+    const s3 = new S3Client();
+    await mq.send({ event: 'workerReady' });
 
-    if (err || code !== 0) {
-      console.log(err);
-      await mq.send({
-        event: 'workerError',
-        reason: 'ArtilleryError',
-        exitCode: code,
-        logs: { stdout, stderr }
-      });
-    }
-  } catch (err) {
-    console.error(err);
+    let waitingFor = 0;
+    const MAX_WAIT_MSEC = 3 * 60 * 1000;
+    const SLEEP_MSEC = 2500;
 
-    await mq.send({
-      event: 'workerError',
-      reason: 'StartupFailure',
-      logs: {
-        err: {
-          message: err.message,
-          stack: err.stack
+    if (WAIT_FOR_GREEN) {
+      while (waitingFor < MAX_WAIT_MSEC) {
+        try {
+          const params = {
+            Bucket: BUCKET,
+            Key: `/${TEST_RUN_ID}/green`
+          };
+          await s3.send(new HeadObjectCommand(params));
+          break;
+        } catch (_err) {
+          await sleep(SLEEP_MSEC);
+          waitingFor += SLEEP_MSEC;
         }
       }
-    });
+    }
+
+    try {
+      const { err, code, stdout, stderr } = await execArtillery({
+        SQS_QUEUE_URL,
+        SQS_REGION,
+        TEST_RUN_ID,
+        WORKER_ID,
+        ARTILLERY_ARGS,
+        TEST_DATA_LOCATION,
+        ENV,
+        ARTILLERY_CLOUD_API_KEY,
+        ARTILLERY_CLOUD_ENDPOINT
+      });
+
+      if (err || code !== 0) {
+        console.log(err);
+        await mq.send({
+          event: 'workerError',
+          reason: 'ArtilleryError',
+          exitCode: code,
+          logs: { stdout, stderr }
+        });
+      }
+    } catch (err) {
+      console.error(err);
+
+      await mq.send({
+        event: 'workerError',
+        reason: 'StartupFailure',
+        logs: {
+          err: {
+            message: err.message,
+            stack: err.stack
+          }
+        }
+      });
+    }
+  } finally {
+    // Always clear the watchdog so it is not frozen with the execution
+    // environment and resumed (bound to this invocation's context and SQS
+    // queue) by a later invocation. Calling clearInterval again after the
+    // callback cleared it itself is a safe no-op
+    clearInterval(interval);
   }
 }
 
